@@ -159,6 +159,32 @@ CREATE TABLE IF NOT EXISTS translation_exports (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, lang, version)
 );
+
+-- 多语批次交付：一次事务把原文与选定语言冻结为同一时间轴的一个批次。
+-- 批次只插入不更新：后续编辑/重排/新交付都不改变已生成批次。
+CREATE TABLE IF NOT EXISTS delivery_batches (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  sub_version   INTEGER NOT NULL,            -- 冻结时的字幕集版本
+  rules_version INTEGER NOT NULL,            -- 冻结时的规则版本
+  cue_count     INTEGER NOT NULL,            -- 冻结时整版字幕条数（各文件一致）
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_batches_project
+  ON delivery_batches(project_id, id);
+
+-- 批次清单关联的文件：原文（exports）一版 + 每种语言译文（translation_exports）各一版。
+-- 文件本体仍在既有导出表中（不可变快照），此处只记录关联，下载走既有下载接口。
+CREATE TABLE IF NOT EXISTS delivery_batch_files (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id  INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  kind      TEXT NOT NULL,                   -- source（原文）/ translation（译文）
+  lang      TEXT NOT NULL DEFAULT '',        -- kind=translation 的语言代号；source 恒为 ''
+  export_id INTEGER NOT NULL,                -- exports.id 或 translation_exports.id
+  version   INTEGER NOT NULL,                -- 对应导出序列内的版本号
+  cue_count INTEGER NOT NULL,
+  UNIQUE(batch_id, kind, lang)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -192,6 +218,7 @@ function loadProject(db, id) {
   ).all(id);
   const revisions = listRevisions(db, id);
   const wordRevisions = listWordRevisions(db, id);
+  const deliveries = listDeliveries(db, id);
   return {
     id: project.id,
     name: project.name,
@@ -207,6 +234,7 @@ function loadProject(db, id) {
     exports: exportsList,
     revisions,
     word_revisions: wordRevisions,
+    deliveries,
   };
 }
 
@@ -262,6 +290,48 @@ function bumpSubVersion(db, projectId) {
   return db.prepare('SELECT sub_version FROM projects WHERE id = ?').get(projectId).sub_version;
 }
 
+/** 批次文件行 → 清单中的文件项（lang 仅译文携带；下载地址由路由层补充） */
+function mapBatchFile(row) {
+  return {
+    kind: row.kind,                            // source（原文）/ translation（译文）
+    lang: row.kind === 'translation' ? row.lang : null,
+    version: row.version,                      // 对应导出序列内的版本号
+    cue_count: row.cue_count,
+  };
+}
+
+/** 项目下全部交付批次清单（含文件关联），按批次号倒序 */
+function listDeliveries(db, projectId) {
+  const batches = db.prepare(
+    `SELECT id, sub_version, rules_version, cue_count, created_at
+       FROM delivery_batches WHERE project_id = ? ORDER BY id DESC`
+  ).all(projectId);
+  const filesStmt = db.prepare(
+    'SELECT kind, lang, version, cue_count FROM delivery_batch_files WHERE batch_id = ? ORDER BY id'
+  );
+  return batches.map((b) => ({ ...b, files: filesStmt.all(b.id).map(mapBatchFile) }));
+}
+
+/** 单个交付批次清单（含文件关联）；不存在或不属于该项目返回 null */
+function loadDelivery(db, projectId, batchId) {
+  const head = db.prepare(
+    'SELECT * FROM delivery_batches WHERE id = ? AND project_id = ?'
+  ).get(batchId, projectId);
+  if (!head) return null;
+  const files = db.prepare(
+    'SELECT kind, lang, version, cue_count FROM delivery_batch_files WHERE batch_id = ? ORDER BY id'
+  ).all(batchId);
+  return {
+    id: head.id,
+    project_id: head.project_id,
+    sub_version: head.sub_version,
+    rules_version: head.rules_version,
+    cue_count: head.cue_count,
+    created_at: head.created_at,
+    files: files.map(mapBatchFile),
+  };
+}
+
 /** 项目下全部逐词修正提议摘要（不含逐项明细），按时间倒序 */
 function listWordRevisions(db, projectId) {
   return db.prepare(
@@ -311,5 +381,6 @@ function loadWordRevision(db, projectId, revisionId) {
 
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  listWordRevisions, loadWordRevision, bumpSubVersion,
+  listDeliveries, loadDelivery, DEFAULT_RULES,
 };

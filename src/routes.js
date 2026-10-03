@@ -3,7 +3,8 @@
 const express = require('express');
 const {
   loadProject, listRevisions, loadRevision,
-  listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  listWordRevisions, loadWordRevision, bumpSubVersion,
+  listDeliveries, loadDelivery, DEFAULT_RULES,
 } = require('./db');
 const { computeLayout, validateStructure, validateRules } = require('./layout');
 const { validateWords, validateCuts, validateRules: validateRulesInput, validateSubtitleEdit } = require('./validate');
@@ -13,6 +14,7 @@ const {
   normalizeLang, parseTranslationBody, parseConfirmBody, checkTranslationText,
   syncTranslations, buildLangView, listLanguages, evaluateExport, mapRow,
 } = require('./translation');
+const { parseDeliveryBody, evaluateDelivery } = require('./delivery');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -1145,6 +1147,150 @@ function createApp(db) {
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="project-${p.id}-${lang}-v${row.version}.vtt"`);
     res.send(row.content);
+  });
+
+  // ---------- 多语批次交付 ----------
+  //
+  // 把原文与选定语言冻结为同一时间轴的一个批次：提交当前字幕集版本、规则版本、
+  // 非空不重复的语言列表与各语言逐行译文版本；服务端在一次事务内核对源整版结构
+  // 与现行规则、每行译文为 current 且满足字数/字速、提交版本仍有效。
+  // 任一语言缺译/待复核/无效/版本漂移 → 按语言与字幕行返回原因，整批不生成快照、
+  // 不消耗任何导出序列版本号；成功时在原文与各语言导出序列中各生成一个不可变
+  // WebVTT 版本，并以批次清单关联文件、字幕集版本与规则版本。
+
+  /** 批次清单中的文件项补充既有下载地址（原文/译文下载接口不变） */
+  function decorateDelivery(projectId, manifest) {
+    return {
+      ...manifest,
+      files: manifest.files.map((f) => ({
+        ...f,
+        download_url: f.kind === 'source'
+          ? `/api/projects/${projectId}/exports/${f.version}`
+          : `/api/projects/${projectId}/translations/${encodeURIComponent(f.lang)}/exports/${f.version}`,
+      })),
+    };
+  }
+
+  /**
+   * 交付批次：{ sub_version, rules_version, languages: [...], versions: { lang: { 字幕ID: 译文版本 } } }
+   *   400 请求形状非法（空语言列表/重复语言/缺版本表/版本非正整数等）；
+   *   409 字幕集版本或规则版本漂移（带当前值）；
+   *   422 任一语言缺译/待复核/无效/译文版本漂移，或源整版结构/规则冲突
+   *       （按语言与字幕行分类返回，整批不生成快照）；
+   *   201 批次清单（含各文件在既有导出序列中的版本号与下载地址）。
+   */
+  app.post('/api/projects/:id/deliveries', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseDeliveryBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '批次交付请求非法，未生成交付', errors: parsed.errors });
+    }
+
+    class DeliveryReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '批次交付被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 事务内读取权威当前状态并核对（版本漂移/缺译/待复核/无效/源整版冲突）
+      const check = evaluateDelivery(db, p.id, parsed.parsed);
+
+      if (check.sub_version_stale || check.rules_version_stale) {
+        const parts = [];
+        if (check.sub_version_stale) {
+          parts.push(`字幕集已被修改（你基于 v${parsed.parsed.sub_version}，当前已是 v${check.sub_version}）`);
+        }
+        if (check.rules_version_stale) {
+          parts.push(`规则已被修改（你基于 v${parsed.parsed.rules_version}，当前已是 v${check.rules_version}）`);
+        }
+        throw new DeliveryReject(409, {
+          error: `${parts.join('；')}，请刷新后重新交付`,
+          current: { sub_version: check.sub_version, rules_version: check.rules_version },
+        });
+      }
+      if (!check.ok) {
+        const problems = check.conflicts.length + check.languages.reduce(
+          (n, l) => n + l.missing.length + l.review.length + l.invalid.length +
+            l.stale.length + l.unknown.length,
+          0
+        );
+        throw new DeliveryReject(422, {
+          error: `批次交付核对未通过（${problems} 处问题），整批未生成快照、未消耗任何版本`,
+          current: { sub_version: check.sub_version, rules_version: check.rules_version },
+          conflicts: check.conflicts,
+          languages: check.languages,
+        });
+      }
+
+      // 全部通过：原文 + 每种语言各生成一个不可变 WebVTT 版本（同一事务、同一源时间轴）
+      const cueCount = check.cues.length;
+      const sourceContent = toWebVtt(check.cues);
+      const sourceVersion = (db.prepare(
+        'SELECT COALESCE(MAX(version), 0) AS v FROM exports WHERE project_id = ?'
+      ).get(p.id).v) + 1;
+      const srcInfo = db.prepare(
+        'INSERT INTO exports (project_id, version, content, cue_count) VALUES (?, ?, ?, ?)'
+      ).run(p.id, sourceVersion, sourceContent, cueCount);
+
+      const batchId = db.prepare(
+        `INSERT INTO delivery_batches (project_id, sub_version, rules_version, cue_count)
+         VALUES (?, ?, ?, ?)`
+      ).run(p.id, check.sub_version, check.rules_version, cueCount).lastInsertRowid;
+
+      const insFile = db.prepare(
+        `INSERT INTO delivery_batch_files (batch_id, kind, lang, export_id, version, cue_count)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      insFile.run(batchId, 'source', '', srcInfo.lastInsertRowid, sourceVersion, cueCount);
+
+      for (const lang of parsed.parsed.languages) {
+        const byCue = check.translationsByLang.get(lang);
+        // 译文沿用源行起止：与原文快照同一时间轴
+        const langCues = check.cues.map((cue, i) => ({
+          start_ms: cue.start_ms, end_ms: cue.end_ms,
+          text: byCue.get(cue.id).text, idx: i,
+        }));
+        const content = toWebVtt(langCues);
+        const version = (db.prepare(
+          'SELECT COALESCE(MAX(version), 0) AS v FROM translation_exports WHERE project_id = ? AND lang = ?'
+        ).get(p.id, lang).v) + 1;
+        const info = db.prepare(
+          'INSERT INTO translation_exports (project_id, lang, version, content, cue_count) VALUES (?, ?, ?, ?, ?)'
+        ).run(p.id, lang, version, content, cueCount);
+        insFile.run(batchId, 'translation', lang, info.lastInsertRowid, version, cueCount);
+      }
+      return batchId;
+    });
+
+    try {
+      const batchId = tx();
+      res.status(201).json(decorateDelivery(p.id, loadDelivery(db, p.id, batchId)));
+    } catch (err) {
+      if (err instanceof DeliveryReject) {
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
+  /** 交付批次清单列表（含各文件版本号与既有下载地址） */
+  app.get('/api/projects/:id/deliveries', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json(listDeliveries(db, p.id).map((m) => decorateDelivery(p.id, m)));
+  });
+
+  /** 单个交付批次清单 */
+  app.get('/api/projects/:id/deliveries/:bid', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const manifest = loadDelivery(db, p.id, Number(req.params.bid));
+    if (!manifest) return res.status(404).json({ error: `交付批次 ${req.params.bid} 不存在` });
+    res.json(decorateDelivery(p.id, manifest));
   });
 
   return app;

@@ -307,6 +307,7 @@ module.exports = {
   parseConfirmBody,
   checkTranslationText,
   syncTranslations,
+  activeTranslationsByLang,
   buildLangView,
   listLanguages,
   listHistory,

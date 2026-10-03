@@ -86,6 +86,7 @@ function renderAll() {
   renderExports();
   renderRevisions();
   renderWordRevisions();
+  renderDeliveries();
   $('#force-row').classList.add('hidden');
 }
 
@@ -1053,6 +1054,103 @@ async function exportTranslation() {
   }
 }
 
+// ---------- 多语批次交付 ----------
+
+function renderDeliveries() {
+  const p = state.project;
+  const box = $('#dl-list');
+  box.innerHTML = '';
+  if (!p) return;
+  const list = p.deliveries || [];
+  $('#dl-stats').textContent = `（共 ${list.length} 批）`;
+  if (list.length === 0) {
+    box.innerHTML = '<div class="empty">尚无交付批次。在左侧 ⑧ 提交语言列表与各语言逐行译文版本后，一次事务冻结原文 + 多语。</div>';
+    return;
+  }
+  for (const b of list) {
+    const row = document.createElement('div');
+    row.className = 'rev-head accepted';
+    const title = document.createElement('div');
+    title.className = 'rev-title';
+    title.innerHTML =
+      `批次 #${b.id}<div class="rev-note">` +
+      `${b.cue_count} 条 · 字幕集 v${b.sub_version} · 规则 v${b.rules_version} · ${b.created_at}` +
+      '</div>';
+    const files = document.createElement('div');
+    files.className = 'rev-actions';
+    for (const f of b.files) {
+      const a = document.createElement('a');
+      a.href = f.download_url;
+      a.textContent = `⬇ ${f.kind === 'source' ? '原文' : f.lang} v${f.version}.vtt`;
+      a.download = '';
+      files.appendChild(a);
+    }
+    row.append(title, files);
+    box.appendChild(row);
+  }
+}
+
+/** 按语言列表抓取各语言当前译文版本，生成交付载荷模板 */
+async function fillDeliveryTemplate() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  const langs = $('#dl-langs').value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (langs.length === 0) return toast('请先填写目标语言列表（逗号分隔，如 en,fr）', true);
+  const versions = {};
+  for (const lang of langs) {
+    const { status, body } = await api(`/api/projects/${p.id}/translations/${encodeURIComponent(lang)}`);
+    if (status !== 200) return toast(`载入语言 ${lang} 失败：${body?.error || status}`, true);
+    versions[lang] = {};
+    for (const e of body.entries) {
+      if (e.translation) versions[lang][String(e.cue.id)] = e.translation.version;
+    }
+  }
+  $('#dl-json').value = JSON.stringify({
+    sub_version: p.sub_version,
+    rules_version: p.rules.version,
+    languages: langs,
+    versions,
+  }, null, 2);
+  toast(`已按 ${langs.join('、')} 的当前译文版本填入模板（缺译行未列入，服务端会逐行核对）`);
+}
+
+async function submitDelivery() {
+  const p = state.project;
+  if (!p) return toast('请先选择项目', true);
+  let parsed;
+  try {
+    parsed = JSON.parse($('#dl-json').value || '{}');
+  } catch (e) {
+    return toast('JSON 解析失败：' + e.message, true);
+  }
+  const { status, body } = await api(`/api/projects/${p.id}/deliveries`, {
+    method: 'POST', body: JSON.stringify(parsed),
+  });
+  if (status === 201) {
+    toast(`✓ 批次 #${body.id} 已交付：${body.files.length} 个文件（${body.cue_count} 条，字幕集 v${body.sub_version}），快照不可变`);
+    await loadProject(p.id);
+  } else if (status === 400) {
+    toast('请求非法：' + (body.errors || []).join('；'), true);
+  } else if (status === 409) {
+    toast(body.error, true);
+    await loadProject(p.id);
+  } else if (status === 422) {
+    const parts = (body.languages || []).map((l) => {
+      const segs = [];
+      if (l.missing?.length) segs.push(`缺译 ${l.missing.length} 行（${l.missing.slice(0, 3).map((m) => `#${m.subtitle_id}`).join('、')}）`);
+      if (l.review?.length) segs.push(`待复核 ${l.review.length} 行`);
+      if (l.invalid?.length) segs.push(`规则不通过 ${l.invalid.length} 行`);
+      if (l.stale?.length) segs.push(`版本漂移 ${l.stale.length} 行`);
+      if (l.unknown?.length) segs.push(`未知行 ${l.unknown.length} 个`);
+      return segs.length ? `${l.lang}: ${segs.join('，')}` : null;
+    }).filter(Boolean);
+    if (body.conflicts?.length) parts.push(`整版冲突 ${body.conflicts.length} 处`);
+    toast((body.error || '交付核对未通过') + (parts.length ? '：' + parts.join('；') : ''), true);
+  } else {
+    toast(body?.error || '交付失败', true);
+  }
+}
+
 // ---------- 示例数据 ----------
 
 const SAMPLE_WORDS = [
@@ -1107,5 +1205,7 @@ $('#tr-lang').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); $('#btn-tr-load').click(); }
 });
 $('#btn-tr-export').addEventListener('click', exportTranslation);
+$('#btn-dl-fill').addEventListener('click', fillDeliveryTemplate);
+$('#btn-dl-submit').addEventListener('click', submitDelivery);
 
 loadProjects();

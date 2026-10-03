@@ -109,6 +109,23 @@
         <ul id="tr-export-list" class="export-list"></ul>
         <p class="hint">导出前须当前每行都有<strong>有效当前译文</strong>且整版符合时间与切点约束，否则列出缺漏/冲突且不生成快照；已导出快照不可变。</p>
       </section>
+
+      <section class="panel">
+        <h2>⑧ 多语批次交付</h2>
+        <p class="hint">把<strong>原文 + 选定语言</strong>冻结为同一时间轴的一个批次：一次事务核对源整版与现行规则、
+        每行译文为当前有效、提交版本未漂移；任一语言缺译/待复核/无效/版本漂移则<strong>整批不生成快照</strong>。
+        成功时在原文与各语言导出序列中各生成一个不可变 WebVTT 版本，并生成批次清单。</p>
+        <div class="row">
+          <input id="dl-langs" type="text" placeholder="目标语言列表（逗号分隔，如 en,fr）" spellcheck="false">
+          <button id="btn-dl-fill" class="secondary">填入模板</button>
+        </div>
+        <textarea id="dl-json" rows="8" spellcheck="false"
+          placeholder='{"sub_version":1,"rules_version":1,"languages":["en"],"versions":{"en":{"12":1,"13":1}}}'></textarea>
+        <div class="row buttons">
+          <button id="btn-dl-submit" class="primary wide">校验并交付批次</button>
+        </div>
+        <p class="hint">「填入模板」按语言列表抓取各语言当前译文版本生成载荷；批次文件可经既有下载地址取得，后续编辑不影响旧批次。</p>
+      </section>
     </aside>
 
     <section class="content">
@@ -145,6 +162,11 @@
         <ul id="tr-export-list2" class="export-list"></ul>
         <h3>历史译文（源行已重排删除/重新导入，不按序号挪用）</h3>
         <div id="tr-history" class="tr-history"></div>
+      </div>
+
+      <div class="panel">
+        <h2>交付批次清单 <span id="dl-stats" class="hint"></span></h2>
+        <div id="dl-list" class="rev-list"></div>
       </div>
 
       <div class="panel">
