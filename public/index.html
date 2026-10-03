@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>字幕校时工作台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>🎬 字幕校时工作台</h1>
+    <div class="project-bar">
+      <select id="project-select"></select>
+      <button id="btn-new-project" class="secondary">＋ 新建项目</button>
+      <button id="btn-refresh" class="secondary">⟳ 刷新</button>
+    </div>
+  </header>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <main>
+    <aside>
+      <section class="panel">
+        <h2>① 导入转写与切点</h2>
+        <p class="hint">JSON 格式：<code>{"words":[{"text":"词","start_ms":0,"end_ms":500}],"cuts":[6000]}</code>。
+        时间无效或倒序/重叠的词段会被拒绝。</p>
+        <textarea id="import-json" rows="7" spellcheck="false" placeholder='{"words":[...],"cuts":[...]}'></textarea>
+        <div class="row">
+          <input id="import-name" type="text" placeholder="新项目名（留空则导入当前项目）">
+        </div>
+        <div class="row buttons">
+          <button id="btn-sample" class="secondary">载入示例</button>
+          <button id="btn-sample-conflict" class="secondary">载入冲突示例</button>
+          <button id="btn-import" class="primary">导入</button>
+        </div>
+        <label class="row checkbox hidden" id="force-row">
+          <input type="checkbox" id="import-force"> 当前项目已有字幕，确认清空并覆盖导入
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>② 排版规则 <span id="rules-version" class="tag"></span></h2>
+        <label>单条最大字数
+          <input id="rule-max-chars" type="number" min="1" max="500">
+        </label>
+        <label>最短显示时长 (ms)
+          <input id="rule-min-duration" type="number" min="0" max="60000" step="100">
+        </label>
+        <label>每秒最多字数
+          <input id="rule-max-cps" type="number" min="1" max="200" step="0.5">
+        </label>
+        <div class="row buttons">
+          <button id="btn-save-rules" class="primary">保存规则</button>
+        </div>
+        <p class="hint">保存后点「重新排版」生效。版本号防止并发覆盖：过期提交会被拒绝并返回当前内容。</p>
+      </section>
+
+      <section class="panel">
+        <h2>③ 排版</h2>
+        <button id="btn-layout" class="primary wide">重新排版（仅未锁定字幕）</button>
+        <p class="hint">锁定 🔒 的字幕保持不动；规则冲突时会列出受影响词段与冲突条件，不会输出貌似完整的结果。</p>
+      </section>
+
+      <section class="panel">
+        <h2>④ 确认导出</h2>
+        <button id="btn-export" class="primary wide">确认当前字幕并导出 WebVTT</button>
+        <ul id="export-list" class="export-list"></ul>
+        <p class="hint">每次确认生成一个不可变版本，可随时再次下载；后续修改不影响旧文件。</p>
+      </section>
+
+      <section class="panel">
+        <h2>⑤ 批量修订提议（字幕）</h2>
+        <p class="hint">针对<strong>未锁定</strong>字幕一次提交一组修订，不直接改正正式字幕；预览核对后再整组采纳。
+        格式：<code>{"note":"说明","items":[{"subtitle_id":1,"cue_version":1,"text":"替代文本","start_ms":0,"end_ms":1000}]}</code>
+        （时间可省略；空组、重复 ID、空文本、非法时间会被拒绝）</p>
+        <input id="rev-note" type="text" placeholder="说明（可选）">
+        <textarea id="rev-json" rows="6" spellcheck="false" placeholder='{"items":[{"subtitle_id":1,"cue_version":1,"text":"…"}]}'></textarea>
+        <div class="row buttons">
+          <button id="btn-rev-fill" class="secondary">填入所有行</button>
+          <button id="btn-rev-submit" class="primary">提交提议</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>⑥ 逐词时间修正（词序/词文本不变）</h2>
+        <p class="hint">校对者发现逐词转写的时间偏差时，按<strong>词序号</strong>提交一组起止毫秒，携带读取时字幕集版本；
+        先预览<strong>受影响字幕与冲突</strong>，再确认。锁定字幕原样保留；仅受影响的未锁定区间重排，
+        未受影响字幕保留 ID/行版本/人工文本。
+        格式：<code>{"note":"说明","sub_version":1,"items":[{"word_idx":0,"start_ms":0,"end_ms":480}]}</code></p>
+        <input id="wr-note" type="text" placeholder="说明（可选）">
+        <textarea id="wr-json" rows="6" spellcheck="false" placeholder='{"sub_version":1,"items":[{"word_idx":0,"start_ms":0,"end_ms":480}]}'></textarea>
+        <div class="row buttons">
+          <button id="btn-wr-fill" class="secondary">填入所有词</button>
+          <button id="btn-wr-submit" class="primary">提交修正提议</button>
+        </div>
+        <p class="hint">提交只保存原值快照、不动正式词与字幕；预览通过后再<strong>确认</strong>（原子更新词时间+重排+推进版本）。</p>
+      </section>
+      <section class="panel">
+        <h2>⑦ 多语言译文字幕</h2>
+        <p class="hint">译文<strong>沿用源字幕的起止时间与词区间</strong>，不改词、切点与原文；保存须带读取时行版本与译文版本。
+        源字幕文本/时间/词区间变化后译文转<strong>待复核</strong>；仅锁定或展示顺序变化不失效；重排删除的原行译文留作历史，新行视为缺译。</p>
+        <div class="row">
+          <input id="tr-lang" type="text" placeholder="目标语言代号（如 en、ja-JP）" spellcheck="false">
+          <button id="btn-tr-load" class="secondary">载入语言</button>
+        </div>
+        <div class="row buttons">
+          <button id="btn-tr-export" class="primary wide">校验并导出该语言 WebVTT</button>
+        </div>
+        <ul id="tr-export-list" class="export-list"></ul>
+        <p class="hint">导出前须当前每行都有<strong>有效当前译文</strong>且整版符合时间与切点约束，否则列出缺漏/冲突且不生成快照；已导出快照不可变。</p>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div id="conflict-panel" class="panel conflict hidden">
+        <h2>⚠ 冲突报告</h2>
+        <ul id="conflict-list"></ul>
+      </div>
+
+      <div class="panel">
+        <h2>修订提议历史 <span id="rev-stats" class="hint"></span></h2>
+        <div id="rev-list" class="rev-list"></div>
+      </div>
+
+      <div id="rev-detail-panel" class="panel hidden">
+        <h2 id="rev-detail-title"></h2>
+        <div id="rev-detail-body"></div>
+      </div>
+
+      <div class="panel">
+        <h2>逐词修正提议历史 <span id="wr-stats" class="hint"></span></h2>
+        <div id="wr-list" class="rev-list"></div>
+      </div>
+
+      <div id="wr-detail-panel" class="panel hidden">
+        <h2 id="wr-detail-title"></h2>
+        <div id="wr-detail-body"></div>
+      </div>
+
+      <div id="tr-panel" class="panel hidden">
+        <h2>译文字幕 <span id="tr-lang-tag" class="tag"></span> <span id="tr-stats" class="hint"></span></h2>
+        <p class="hint">每条最多一份当前译文；保存即按现行最大字数/字速规则校验。<strong>待复核</strong>行请对照原文修改后重新保存，或直接「✓ 确认仍适用」。</p>
+        <div id="tr-table" class="tr-table"></div>
+        <h3>译文导出快照</h3>
+        <ul id="tr-export-list2" class="export-list"></ul>
+        <h3>历史译文（源行已重排删除/重新导入，不按序号挪用）</h3>
+        <div id="tr-history" class="tr-history"></div>
+      </div>
+
+      <div class="panel">
+        <h2>字幕列表 <span id="sub-version" class="tag"></span> <span id="cue-stats" class="hint"></span></h2>
+        <div id="cue-table" class="cue-table"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

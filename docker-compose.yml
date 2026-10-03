@@ -1,0 +1,16 @@
+# 一条命令启动：docker compose up --build
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"          # 访问 http://localhost:3000
+    environment:
+      PORT: 3000             # 服务端口
+      DB_PATH: /data/subtitles.db
+      SEED_DEMO: "true"      # 首次启动播种演示项目；设为 "false" 关闭
+    volumes:
+      - subtitle-data:/data  # SQLite 数据持久化（含全部导出版本快照）
+    restart: unless-stopped
+
+volumes:
+  subtitle-data:

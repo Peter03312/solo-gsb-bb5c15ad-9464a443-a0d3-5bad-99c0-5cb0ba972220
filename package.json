@@ -1,0 +1,15 @@
+{
+  "name": "subtitle-timing-workbench",
+  "version": "1.0.0",
+  "description": "视频字幕校时 Web 工作台：逐词转写 + 镜头切点排版为字幕，支持锁定、冲突报告、版本化导出 WebVTT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.22.3"
+  }
+}
