@@ -11,8 +11,10 @@ const { parseRevisionItems, evaluateRevision } = require('./revision');
 const { parseWordRevisionItems, evaluateWordRevision } = require('./word-revision');
 const {
   normalizeLang, parseTranslationBody, parseConfirmBody, checkTranslationText,
-  syncTranslations, buildLangView, listLanguages, evaluateExport, mapRow,
+  syncTranslations, buildLangView, listLanguages, activeTranslationsByLang,
+  evaluateExport, mapRow,
 } = require('./translation');
+const { parseDeliveryBody, evaluateDelivery, listBatches, loadBatch } = require('./delivery');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -1145,6 +1147,200 @@ function createApp(db) {
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="project-${p.id}-${lang}-v${row.version}.vtt"`);
     res.send(row.content);
+  });
+
+  // ---------- 片方多语字幕交付（原文 + 多语言冻结为同一时间轴的一个批次） ----------
+  //
+  // 一次提交把当前源字幕与选定语言冻结为一个批次：携带字幕集版本、规则版本、
+  // 非空且不重复的语言列表，以及各语言逐行译文版本。服务端在一个事务内核对
+  // 源整版结构与现行规则、每行译文 current 且满足字数/字速、提交版本仍有效；
+  // 任一语言缺译/待复核/无效/版本漂移，按语言和字幕行返回原因，整批不生成快照
+  // 或消耗版本。成功时在现有原文与各语言导出序列中各生成一个不可变 WebVTT 版本，
+  // 并以批次清单关联。文件经既有下载接口取得，旧批次不随后续编辑改变。
+
+  /**
+   * 提交交付批次。
+   *   {note?, sub_version, rules_version, languages:[...],
+   *    translations: { "<lang>": [{subtitle_id, version}, ...] }}
+   * 400 请求非法；409 字幕集/规则版本漂移（带 current）；422 源整版冲突或按语言/行核对失败；
+   * 201 整批冻结成功（事务内），返回批次清单与各文件下载地址。
+   */
+  app.post('/api/projects/:id/deliveries', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+
+    // 1. 形状校验（事务外，纯请求问题不触碰任何数据）
+    const parsed = parseDeliveryBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '交付请求非法，未生成批次', errors: parsed.errors });
+    }
+    const request = parsed.request;
+
+    // 2. 清单覆盖性快速校验：每种语言的逐行条目必须与当前字幕行一一对应。
+    //    （事务内会对权威状态再核对一次；此处给出更早、更明确的中文原因。）
+    if (p.subtitles.length === 0) {
+      return res.status(422).json({ error: '没有字幕可交付，请先排版', conflicts: [] });
+    }
+    const cueIds = new Set(p.subtitles.map((c) => c.id));
+    const coverageErrors = [];
+    for (const lang of request.languages) {
+      const ids = request.itemsByLang.get(lang).map((it) => it.subtitle_id);
+      if (ids.length !== cueIds.size) {
+        coverageErrors.push(
+          `语言 ${lang} 的逐行译文版本清单为 ${ids.length} 行，当前字幕为 ${cueIds.size} 行：须逐行一一对应`
+        );
+        continue;
+      }
+      const unknown = ids.filter((sid) => !cueIds.has(sid));
+      if (unknown.length > 0) {
+        coverageErrors.push(`语言 ${lang} 的清单含当前字幕集不存在的字幕行：${unknown.join(', ')}`);
+      }
+    }
+    if (coverageErrors.length > 0) {
+      return res.status(400).json({ error: '交付请求非法，未生成批次', errors: coverageErrors });
+    }
+
+    class DeliveryReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '交付被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 3. 事务内读取权威当前状态
+      const fresh = loadProject(db, p.id);
+      const activeByLang = new Map(
+        request.languages.map((lang) => [lang, activeTranslationsByLang(db, fresh.id, lang)])
+      );
+      const result = evaluateDelivery(fresh, request, activeByLang);
+
+      // 4. 版本漂移（字幕集/规则）：整批拒绝，带当前值；不消耗任何版本
+      if (result.sub_version_stale || result.rules_version_stale) {
+        const why = [];
+        if (result.sub_version_stale) {
+          why.push(`字幕集版本漂移：提交基于 v${request.sub_version}，当前已是 v${fresh.sub_version}`);
+        }
+        if (result.rules_version_stale) {
+          why.push(`规则版本漂移：提交基于 v${request.rules_version}，当前已是 v${fresh.rules.version}`);
+        }
+        throw new DeliveryReject(409, {
+          error: `${why.join('；')}；整批未生成快照，请刷新后重新提交`,
+          sub_version_stale: result.sub_version_stale,
+          rules_version_stale: result.rules_version_stale,
+          current: {
+            sub_version: fresh.sub_version,
+            rules_version: fresh.rules.version,
+            rules: fresh.rules,
+            subtitles: fresh.subtitles,
+          },
+        });
+      }
+
+      // 5. 源整版结构/规则冲突，或任一语言缺译/待复核/无效/译文版本漂移：整批拒绝
+      const langProblems = result.languages.filter((l) => l.problem_count > 0);
+      if (result.conflicts.length > 0 || langProblems.length > 0) {
+        throw new DeliveryReject(422, {
+          error:
+            `交付核对未通过（源整版冲突 ${result.conflicts.length} 处，` +
+            `${langProblems.length}/${request.languages.length} 种语言存在缺译/待复核/无效/版本漂移），整批未生成快照或消耗版本`,
+          sub_version: fresh.sub_version,
+          rules_version: fresh.rules.version,
+          conflicts: result.conflicts,
+          languages: result.languages.map((l) => ({
+            lang: l.lang,
+            problem_count: l.problem_count,
+            missing: l.missing,
+            review: l.review,
+            invalid: l.invalid,
+            version_stale: l.version_stale,
+          })),
+        });
+      }
+
+      // 6. 全部通过：同一事务内生成原文与各语言不可变 WebVTT，并写入批次与清单。
+      //    快照全部使用当前源行起止（按 idx 时间升序），保证各文件时间轴一致。
+      const sourceContent = toWebVtt(fresh.subtitles);
+      const contents = new Map();
+      for (const lang of request.languages) {
+        const byCue = activeByLang.get(lang);
+        const cues = fresh.subtitles.map((cue) => ({
+          start_ms: cue.start_ms, end_ms: cue.end_ms, text: byCue.get(cue.id).text,
+        }));
+        contents.set(lang, toWebVtt(cues));
+      }
+
+      const batchInfo = db.prepare(
+        `INSERT INTO delivery_batches (project_id, note, sub_version, rules_version, cue_count, lang_count)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(fresh.id, request.note, fresh.sub_version, fresh.rules.version,
+        fresh.subtitles.length, request.languages.length);
+      const batchId = batchInfo.lastInsertRowid;
+
+      // 原文：在现有 exports 序列占一个普通版本
+      const srcVersion = (db.prepare(
+        'SELECT COALESCE(MAX(version), 0) AS v FROM exports WHERE project_id = ?'
+      ).get(fresh.id).v) + 1;
+      const srcExportId = db.prepare(
+        'INSERT INTO exports (project_id, version, content, cue_count) VALUES (?, ?, ?, ?)'
+      ).run(fresh.id, srcVersion, sourceContent, fresh.subtitles.length).lastInsertRowid;
+      db.prepare(
+        `INSERT INTO delivery_files
+           (batch_id, project_id, kind, lang, export_kind, export_id, version, cue_count, ord)
+         VALUES (?, ?, 'source', NULL, 'exports', ?, ?, ?, 0)`
+      ).run(batchId, fresh.id, srcExportId, srcVersion, fresh.subtitles.length);
+
+      // 各语言：在现有 translation_exports 序列（按语言独立）各占一个普通版本
+      const insLang = db.prepare(
+        'INSERT INTO translation_exports (project_id, lang, version, content, cue_count) VALUES (?, ?, ?, ?, ?)'
+      );
+      const insFile = db.prepare(
+        `INSERT INTO delivery_files
+           (batch_id, project_id, kind, lang, export_kind, export_id, version, cue_count, ord)
+         VALUES (?, ?, 'translation', ?, 'translation_exports', ?, ?, ?, ?)`
+      );
+      request.languages.forEach((lang, i) => {
+        const next = (db.prepare(
+          'SELECT COALESCE(MAX(version), 0) AS v FROM translation_exports WHERE project_id = ? AND lang = ?'
+        ).get(fresh.id, lang).v) + 1;
+        const exportId = insLang.run(fresh.id, lang, next, contents.get(lang), fresh.subtitles.length).lastInsertRowid;
+        insFile.run(batchId, fresh.id, lang, exportId, next, fresh.subtitles.length, i + 1);
+      });
+
+      return { batchId, sourceContent, contents };
+    });
+
+    try {
+      const done = tx();
+      const batch = loadBatch(db, p.id, done.batchId);
+      // 快照正文随响应一并给出便于直接取用；权威再次下载走既有接口（内容一致且不可变）
+      res.status(201).json({
+        ...batch,
+        files: batch.files.map((f) => ({ ...f, content: f.kind === 'source' ? done.sourceContent : done.contents.get(f.lang) })),
+      });
+    } catch (err) {
+      if (err instanceof DeliveryReject) {
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
+  /** 交付批次清单（按时间倒序） */
+  app.get('/api/projects/:id/deliveries', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    res.json({ project_id: p.id, batches: listBatches(db, p.id) });
+  });
+
+  /** 单个交付批次清单（关联文件、字幕集版本、规则版本；文件正文走既有下载接口） */
+  app.get('/api/projects/:id/deliveries/:bid', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const batch = loadBatch(db, p.id, Number(req.params.bid));
+    if (!batch) return res.status(404).json({ error: `交付批次 ${req.params.bid} 不存在` });
+    res.json(batch);
   });
 
   return app;

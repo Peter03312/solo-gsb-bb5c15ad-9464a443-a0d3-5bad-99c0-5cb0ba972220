@@ -311,5 +311,6 @@ module.exports = {
   listLanguages,
   listHistory,
   evaluateExport,
+  activeTranslationsByLang,
   mapRow,
 };

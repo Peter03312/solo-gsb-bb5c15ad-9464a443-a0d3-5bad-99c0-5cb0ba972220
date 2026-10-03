@@ -159,6 +159,41 @@ CREATE TABLE IF NOT EXISTS translation_exports (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, lang, version)
 );
+
+-- 多语字幕片方交付：一次交付把原文与选定语言冻结为同一时间轴的一个批次。
+-- 批次只记录提交时核对通过的字幕集版本与规则版本；任一语言缺译/待复核/无效/版本漂移
+-- 时整批不生成记录（事务回滚），也不消耗原文/各语言导出序列上的版本号。
+CREATE TABLE IF NOT EXISTS delivery_batches (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  note           TEXT NOT NULL DEFAULT '',
+  sub_version    INTEGER NOT NULL,           -- 冻结时的字幕集版本
+  rules_version  INTEGER NOT NULL,           -- 冻结时的规则版本
+  cue_count      INTEGER NOT NULL,
+  lang_count     INTEGER NOT NULL,           -- 参与交付的目标语言数
+  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 批次内文件清单：1 个原文文件 + 每种语言 1 个译文文件，全部共用同一时间轴。
+-- 每个文件同时在既有导出序列（exports / translation_exports）中占一个普通版本，
+-- 经既有下载接口取得；后续编辑不改旧批次（快照不可变）。
+CREATE TABLE IF NOT EXISTS delivery_files (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id    INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL,                 -- source（原文）/ translation（译文）
+  lang        TEXT,                          -- kind=translation 时为语言代号；原文为 NULL
+  export_kind TEXT NOT NULL,                 -- exports / translation_exports（序列名）
+  export_id   INTEGER NOT NULL,              -- 对应导出表行 ID
+  version     INTEGER NOT NULL,              -- 该导出序列上的版本号
+  cue_count   INTEGER NOT NULL,
+  ord         INTEGER NOT NULL,              -- 批次内顺序：0 为原文，其后按语言顺序
+  UNIQUE(batch_id, ord)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_batches_project
+  ON delivery_batches(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_delivery_files_project
+  ON delivery_files(project_id, batch_id);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
